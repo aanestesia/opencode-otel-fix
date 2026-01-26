@@ -1,0 +1,481 @@
+/**
+ * OpenTelemetry Tracing Module
+ *
+ * This module initializes OpenTelemetry tracing for OpenCode.
+ * It MUST be initialized before any other imports that might create spans
+ * (e.g., the AI SDK).
+ *
+ * Tracing is opt-in via environment variables:
+ * - OTEL_EXPORTER_OTLP_ENDPOINT: The OTLP endpoint URL
+ * - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: Alternative traces-specific endpoint
+ * - OTEL_SERVICE_NAME: Service name (defaults to "opencode")
+ * - OTEL_EXPORTER_OTLP_HEADERS: Headers for the exporter (e.g., "x-api-key=...")
+ * - OTEL_EXPORTER_OTLP_PROTOCOL: Protocol (defaults to "http/protobuf")
+ * - OTEL_LOG_LEVEL: Set to "debug" for diagnostic logging
+ * - OTEL_PRETTY_OUTPUT: Pretty-print JSON outputs (default: "true", set to "false" for minified)
+ * - OTEL_DEBUG_ATTRS: Set to "true" to log span attributes to stderr for debugging
+ */
+
+import { diag, DiagConsoleLogger, DiagLogLevel, trace, type Context } from "@opentelemetry/api"
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http"
+import { Resource } from "@opentelemetry/resources"
+import {
+  BatchSpanProcessor,
+  SimpleSpanProcessor,
+  type SpanProcessor,
+  type ReadableSpan,
+  type Span,
+} from "@opentelemetry/sdk-trace-base"
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node"
+import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions"
+
+/**
+ * Attribute mapping from Vercel AI SDK format to LangSmith/OpenLLMetry format.
+ * LangSmith expects gen_ai.* attributes, but AI SDK uses ai.* attributes.
+ */
+const AI_SDK_TO_LANGSMITH_ATTRS: Record<string, string> = {
+  // Input/Output mappings
+  "ai.prompt.messages": "gen_ai.prompt",
+  "ai.response.text": "gen_ai.completion",
+
+  // Model info
+  "ai.model.id": "gen_ai.request.model",
+  "ai.model.provider": "gen_ai.system",
+
+  // Token usage
+  "ai.usage.promptTokens": "gen_ai.usage.prompt_tokens",
+  "ai.usage.completionTokens": "gen_ai.usage.completion_tokens",
+
+  // Settings
+  "ai.settings.maxTokens": "gen_ai.request.max_tokens",
+  "ai.settings.temperature": "gen_ai.request.temperature",
+  "ai.settings.topP": "gen_ai.request.top_p",
+  "ai.settings.topK": "gen_ai.request.top_k",
+  "ai.settings.frequencyPenalty": "gen_ai.request.frequency_penalty",
+  "ai.settings.presencePenalty": "gen_ai.request.presence_penalty",
+
+  // Finish reason
+  "ai.response.finishReason": "gen_ai.response.finish_reasons",
+
+  // Tool call attributes (for ai.toolCall spans)
+  "ai.toolCall.name": "gen_ai.tool.name",
+  "ai.toolCall.args": "tool_arguments",
+  "ai.toolCall.id": "tool_call_id",
+  "ai.toolCall.result": "tool_result",
+
+  // Tool definitions (for LLM spans)
+  "ai.prompt.tools": "tools",
+  "ai.prompt.toolChoice": "tool_choice",
+}
+
+/**
+ * SpanProcessor that transforms Vercel AI SDK attributes to LangSmith-compatible format.
+ * This wraps another processor and transforms attributes before forwarding.
+ */
+class LangSmithAttributeProcessor implements SpanProcessor {
+  constructor(private readonly delegate: SpanProcessor) {}
+
+  onStart(span: Span, parentContext: Context): void {
+    this.delegate.onStart(span, parentContext)
+  }
+
+  onEnd(span: ReadableSpan): void {
+    // Transform AI SDK attributes to LangSmith format
+    const transformedSpan = this.transformAttributes(span)
+    this.delegate.onEnd(transformedSpan)
+  }
+
+  async shutdown(): Promise<void> {
+    return this.delegate.shutdown()
+  }
+
+  async forceFlush(): Promise<void> {
+    return this.delegate.forceFlush()
+  }
+
+  private transformAttributes(span: ReadableSpan): ReadableSpan {
+    const originalAttrs = span.attributes
+    const newAttrs: Record<string, any> = { ...originalAttrs }
+
+    // Debug: Log all AI SDK attributes for investigation
+    if (process.env.OTEL_DEBUG_ATTRS === "true" && span.name.startsWith("ai.")) {
+      const aiAttrs = Object.entries(originalAttrs)
+        .filter(([k]) => k.startsWith("ai.") || k.startsWith("gen_ai."))
+        .map(([k, v]) => `${k}=${typeof v === "string" && v.length > 100 ? v.slice(0, 100) + "..." : v}`)
+      console.error(`[OTEL DEBUG] Span: ${span.name}`)
+      console.error(`[OTEL DEBUG] AI Attributes: ${aiAttrs.length > 0 ? aiAttrs.join(", ") : "NONE"}`)
+      console.error(`[OTEL DEBUG] All keys: ${Object.keys(originalAttrs).join(", ")}`)
+    }
+
+    // Map AI SDK attributes to LangSmith format
+    for (const [aiKey, langsmithKey] of Object.entries(AI_SDK_TO_LANGSMITH_ATTRS)) {
+      if (originalAttrs[aiKey] !== undefined) {
+        newAttrs[langsmithKey] = originalAttrs[aiKey]
+      }
+    }
+
+    // Also add input.value/output.value for broader compatibility
+    // Try multiple possible attribute names for inputs
+    const inputValue =
+      originalAttrs["ai.prompt.messages"] ||
+      originalAttrs["ai.prompt"] ||
+      originalAttrs["ai.request.messages"]
+    if (inputValue) {
+      newAttrs["input.value"] = inputValue
+      newAttrs["gen_ai.prompt"] = inputValue
+
+      // Parse messages and emit individual attributes for LangSmith compatibility
+      try {
+        const parsed = typeof inputValue === "string" ? JSON.parse(inputValue) : inputValue
+        const messages = Array.isArray(parsed) ? parsed : parsed?.messages
+        if (Array.isArray(messages)) {
+          messages.forEach((msg: { role?: string; content?: string | Array<{ type: string; text?: string }> }, i: number) => {
+            if (msg.role) newAttrs[`gen_ai.prompt.${i}.role`] = msg.role
+            if (msg.content) {
+              // Handle content that can be string or array of content parts
+              let content: string
+              if (typeof msg.content === "string") {
+                content = msg.content
+              } else if (Array.isArray(msg.content)) {
+                // Extract text from content parts array: [{type:"text", text:"..."}, ...]
+                content = msg.content
+                  .filter((part) => part.type === "text" && part.text)
+                  .map((part) => part.text)
+                  .join("\n")
+              } else {
+                content = JSON.stringify(msg.content)
+              }
+              // Truncate very long content to avoid OTEL limits
+              newAttrs[`gen_ai.prompt.${i}.content`] = content.length > 10000 ? content.slice(0, 10000) + "..." : content
+            }
+          })
+        }
+      } catch {
+        // If parsing fails, keep the raw value
+      }
+    }
+
+    // Try multiple possible attribute names for outputs
+    const outputValue =
+      originalAttrs["ai.response.text"] ||
+      originalAttrs["ai.response"] ||
+      originalAttrs["ai.result.text"]
+    if (outputValue) {
+      // Pretty-print JSON outputs for readability (configurable via OTEL_PRETTY_OUTPUT)
+      // Default: true (pretty), set to "false" for minified
+      const prettyOutput = process.env.OTEL_PRETTY_OUTPUT !== "false"
+      let formattedOutput = outputValue
+      if (typeof outputValue === "string" && prettyOutput) {
+        try {
+          const parsed = JSON.parse(outputValue)
+          formattedOutput = JSON.stringify(parsed, null, 2)
+        } catch {
+          // Not JSON, keep as-is
+        }
+      }
+      newAttrs["output.value"] = formattedOutput
+      newAttrs["gen_ai.completion"] = formattedOutput
+      // Also emit as completion.0 for LangSmith
+      newAttrs["gen_ai.completion.0.role"] = "assistant"
+      newAttrs["gen_ai.completion.0.content"] = formattedOutput
+    }
+
+    // Set span kind for LangSmith (helps with visualization)
+    // Tool call spans get "tool" kind, LLM spans get "llm" kind
+    if (span.name === "ai.toolCall") {
+      newAttrs["langsmith.span.kind"] = "tool"
+    } else if (span.name.startsWith("ai.")) {
+      newAttrs["langsmith.span.kind"] = "llm"
+    }
+
+    // Parse tool calls from response for LangSmith TOOLS tab
+    const toolCallsValue = originalAttrs["ai.response.toolCalls"]
+    if (toolCallsValue) {
+      try {
+        const toolCalls = typeof toolCallsValue === "string" ? JSON.parse(toolCallsValue) : toolCallsValue
+        if (Array.isArray(toolCalls)) {
+          toolCalls.forEach((tc: { toolCallId?: string; toolName?: string; args?: unknown }, i: number) => {
+            if (tc.toolCallId) newAttrs[`tool_calls.${i}.id`] = tc.toolCallId
+            if (tc.toolName) newAttrs[`tool_calls.${i}.function.name`] = tc.toolName
+            if (tc.args) {
+              newAttrs[`tool_calls.${i}.function.arguments`] =
+                typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args)
+            }
+          })
+          // Also store as gen_ai format for broader compatibility
+          newAttrs["gen_ai.completion.tool_calls"] = toolCallsValue
+        }
+      } catch {
+        // If parsing fails, keep the raw value
+        newAttrs["gen_ai.completion.tool_calls"] = toolCallsValue
+      }
+    }
+
+    // Parse tool definitions for LangSmith TOOLS tab
+    const toolsValue = originalAttrs["ai.prompt.tools"]
+    if (toolsValue) {
+      try {
+        const tools = typeof toolsValue === "string" ? JSON.parse(toolsValue) : toolsValue
+        if (Array.isArray(tools)) {
+          // Format tools as OpenAI-style function definitions for LangSmith
+          const formattedTools = tools.map((t: { type?: string; name?: string; description?: string; inputSchema?: unknown }) => ({
+            type: t.type || "function",
+            function: {
+              name: t.name,
+              description: t.description,
+              parameters: t.inputSchema,
+            },
+          }))
+          newAttrs["tools"] = JSON.stringify(formattedTools)
+        }
+      } catch {
+        // If parsing fails, keep the raw value
+        newAttrs["tools"] = toolsValue
+      }
+    }
+
+    // For tool call spans, set input/output from args/result
+    if (span.name === "ai.toolCall") {
+      const toolArgs = originalAttrs["ai.toolCall.args"]
+      const toolResult = originalAttrs["ai.toolCall.result"]
+      const toolName = originalAttrs["ai.toolCall.name"]
+
+      if (toolArgs) {
+        const prettyOutput = process.env.OTEL_PRETTY_OUTPUT !== "false"
+        let formattedArgs = toolArgs
+        if (typeof toolArgs === "string" && prettyOutput) {
+          try {
+            formattedArgs = JSON.stringify(JSON.parse(toolArgs), null, 2)
+          } catch {
+            // Not JSON, keep as-is
+          }
+        }
+        newAttrs["input.value"] = formattedArgs
+      }
+
+      if (toolResult) {
+        const prettyOutput = process.env.OTEL_PRETTY_OUTPUT !== "false"
+        let formattedResult = toolResult
+        if (typeof toolResult === "string" && prettyOutput) {
+          try {
+            formattedResult = JSON.stringify(JSON.parse(toolResult), null, 2)
+          } catch {
+            // Not JSON, keep as-is
+          }
+        }
+        newAttrs["output.value"] = formattedResult
+      }
+
+      if (toolName) {
+        newAttrs["name"] = toolName
+      }
+    }
+
+    // Set thread ID for LangSmith grouping (uses session.id from OTEL_RESOURCE_ATTRIBUTES)
+    const threadId = getSessionIdFromEnv()
+    if (threadId) {
+      newAttrs["langsmith.thread.id"] = threadId
+    }
+
+    // Return a proxy that uses transformed attributes
+    return new Proxy(span, {
+      get(target, prop) {
+        if (prop === "attributes") {
+          return newAttrs
+        }
+        return (target as any)[prop]
+      },
+    })
+  }
+}
+
+let provider: NodeTracerProvider | null = null
+let initialized = false
+
+/**
+ * Parse session.id from OTEL_RESOURCE_ATTRIBUTES for LangSmith thread grouping.
+ * Format: "session.id=xxx,agent.name=yyy,..."
+ */
+function getSessionIdFromEnv(): string | undefined {
+  const attrs = process.env.OTEL_RESOURCE_ATTRIBUTES
+  if (!attrs) return undefined
+
+  const match = attrs.match(/session\.id=([^,]+)/)
+  return match?.[1]
+}
+
+/**
+ * Check if OTEL is enabled via environment variables.
+ * We require an explicit endpoint to be set - this keeps OTEL opt-in.
+ */
+function isOtelEnabledByEnv(): boolean {
+  return Boolean(
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT || process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+  )
+}
+
+export interface TracingOptions {
+  serviceName?: string
+  serviceVersion?: string
+  /** Use SimpleSpanProcessor instead of BatchSpanProcessor (useful for debugging) */
+  debug?: boolean
+}
+
+/**
+ * Initialize OpenTelemetry tracing.
+ *
+ * This function MUST be called before any code that might create spans.
+ * It is safe to call multiple times - subsequent calls are no-ops.
+ *
+ * Tracing is only enabled if OTEL_EXPORTER_OTLP_ENDPOINT or
+ * OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set.
+ */
+export function initTracing(opts?: TracingOptions): void {
+  if (initialized) {
+    return
+  }
+  initialized = true
+
+  // Enable diagnostic logging if requested
+  const logLevel = process.env.OTEL_LOG_LEVEL?.toLowerCase()
+  if (logLevel === "debug") {
+    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.DEBUG)
+  } else if (logLevel === "verbose") {
+    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.VERBOSE)
+  } else if (logLevel === "info") {
+    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.INFO)
+  } else if (logLevel === "warn") {
+    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.WARN)
+  } else if (logLevel === "error") {
+    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.ERROR)
+  }
+
+  // If no endpoint is configured, do nothing (keeps OTEL opt-in)
+  if (!isOtelEnabledByEnv()) {
+    diag.debug("OpenTelemetry tracing not enabled: no OTLP endpoint configured")
+    return
+  }
+
+  const serviceName = opts?.serviceName || process.env.OTEL_SERVICE_NAME || "opencode"
+  const serviceVersion = opts?.serviceVersion || process.env.npm_package_version
+
+  diag.info(`Initializing OpenTelemetry tracing for service: ${serviceName}`)
+
+  // Create resource with service information
+  const resource = new Resource({
+    [ATTR_SERVICE_NAME]: serviceName,
+    ...(serviceVersion ? { [ATTR_SERVICE_VERSION]: serviceVersion } : {}),
+  })
+
+  // Create the OTLP exporter
+  // The exporter reads these env vars automatically:
+  // - OTEL_EXPORTER_OTLP_ENDPOINT
+  // - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+  // - OTEL_EXPORTER_OTLP_HEADERS
+  // - OTEL_EXPORTER_OTLP_PROTOCOL (defaults to http/protobuf for this exporter)
+  const exporter = new OTLPTraceExporter()
+
+  // Create the tracer provider
+  provider = new NodeTracerProvider({
+    resource,
+  })
+
+  // Use BatchSpanProcessor for production (batches spans for efficiency)
+  // Use SimpleSpanProcessor for debugging (exports immediately)
+  const baseProcessor =
+    opts?.debug || process.env.OTEL_LOG_LEVEL === "debug"
+      ? new SimpleSpanProcessor(exporter)
+      : new BatchSpanProcessor(exporter, {
+          // Export spans every 5 seconds or when batch is full
+          scheduledDelayMillis: 5000,
+          // Max batch size
+          maxExportBatchSize: 512,
+          // Max queue size
+          maxQueueSize: 2048,
+        })
+
+  // Wrap with LangSmith attribute transformer for compatibility
+  const spanProcessor = new LangSmithAttributeProcessor(baseProcessor)
+
+  provider.addSpanProcessor(spanProcessor)
+
+  // Register as the global tracer provider
+  // This makes spans created by the AI SDK (and any other OTEL-instrumented code)
+  // actually get exported
+  provider.register()
+
+  diag.info("OpenTelemetry tracing initialized successfully")
+}
+
+/**
+ * Gracefully shut down the tracer provider.
+ *
+ * This flushes any pending spans to the exporter before the process exits.
+ * MUST be called before process.exit() or spans may be lost.
+ *
+ * @param timeoutMs Maximum time to wait for shutdown (default: 5000ms)
+ */
+export async function shutdownTracing(timeoutMs = 5000): Promise<void> {
+  if (!provider) {
+    return
+  }
+
+  diag.info("Shutting down OpenTelemetry tracing...")
+
+  try {
+    // Race between shutdown and timeout to avoid hanging the CLI
+    await Promise.race([
+      provider.shutdown(),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ])
+    diag.info("OpenTelemetry tracing shut down successfully")
+  } catch (error) {
+    // Log but don't throw - we don't want shutdown errors to crash the CLI
+    diag.error("Error shutting down OpenTelemetry tracing", error)
+  } finally {
+    provider = null
+  }
+}
+
+/**
+ * Force flush any pending spans without shutting down.
+ * Useful for ensuring spans are exported at specific points.
+ *
+ * @param timeoutMs Maximum time to wait for flush (default: 5000ms)
+ */
+export async function flushTracing(timeoutMs = 5000): Promise<void> {
+  if (!provider) {
+    return
+  }
+
+  try {
+    await Promise.race([
+      provider.forceFlush(),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ])
+  } catch (error) {
+    diag.error("Error flushing OpenTelemetry spans", error)
+  }
+}
+
+/**
+ * Check if tracing has been initialized.
+ */
+export function isTracingInitialized(): boolean {
+  return initialized
+}
+
+/**
+ * Check if tracing is active (initialized AND has a provider).
+ */
+export function isTracingActive(): boolean {
+  return initialized && provider !== null
+}
+
+/**
+ * Get a tracer instance for creating custom spans.
+ * Returns a no-op tracer if tracing is not active.
+ */
+export function getTracer(name: string, version?: string) {
+  return trace.getTracer(name, version)
+}

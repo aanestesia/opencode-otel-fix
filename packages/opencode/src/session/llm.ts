@@ -264,7 +264,18 @@ export namespace LLM {
           extractReasoningMiddleware({ tagName: "think", startWithReasoning: false }),
         ],
       }),
-      experimental_telemetry: { isEnabled: cfg.experimental?.openTelemetry },
+      experimental_telemetry: {
+        isEnabled: cfg.experimental?.openTelemetry,
+        recordInputs: true,
+        recordOutputs: true,
+        functionId: `opencode.${input.agent.name}`,
+        metadata: {
+          sessionId: input.sessionID,
+          agentName: input.agent.name,
+          modelId: input.model.id,
+          providerId: input.model.providerID,
+        },
+      },
     })
   }
 
