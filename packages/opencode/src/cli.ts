@@ -36,7 +36,7 @@ import { EOL } from "os"
 import { WebCommand } from "./cli/cmd/web"
 import { PrCommand } from "./cli/cmd/pr"
 import { SessionCommand } from "./cli/cmd/session"
-import { shutdownTracing, getTracer } from "./tracing"
+import { shutdownTracing, getTracer, getParentContextFromEnv } from "./tracing"
 import { context, SpanStatusCode } from "@opentelemetry/api"
 
 process.on("unhandledRejection", (e) => {
@@ -131,6 +131,10 @@ const agentName = process.argv.find((arg, i) => process.argv[i - 1] === "--agent
 // Parse session.id from OTEL_RESOURCE_ATTRIBUTES for LangSmith thread grouping
 const sessionId = process.env.OTEL_RESOURCE_ATTRIBUTES?.match(/session\.id=([^,]+)/)?.[1]
 
+// Get parent context from TRACEPARENT env var for trace linking with orchestrator
+// This allows OpenCode spans to appear as children of the orchestrator's parent span
+const parentContext = getParentContextFromEnv()
+
 const rootSpan = tracer.startSpan("opencode.run", {
   attributes: {
     "opencode.agent": agentName,
@@ -139,7 +143,7 @@ const rootSpan = tracer.startSpan("opencode.run", {
     // LangSmith thread grouping - all traces with same session ID are grouped
     ...(sessionId ? { "langsmith.thread.id": sessionId } : {}),
   },
-})
+}, parentContext)
 
 // Run CLI within the root span context so all child spans are linked
 try {

@@ -16,7 +16,15 @@
  * - OTEL_DEBUG_ATTRS: Set to "true" to log span attributes to stderr for debugging
  */
 
-import { diag, DiagConsoleLogger, DiagLogLevel, trace, type Context } from "@opentelemetry/api"
+import {
+  diag,
+  DiagConsoleLogger,
+  DiagLogLevel,
+  trace,
+  propagation,
+  context as otelContext,
+  type Context,
+} from "@opentelemetry/api"
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http"
 import { Resource } from "@opentelemetry/resources"
 import {
@@ -160,6 +168,15 @@ class LangSmithAttributeProcessor implements SpanProcessor {
       originalAttrs["ai.response.text"] ||
       originalAttrs["ai.response"] ||
       originalAttrs["ai.result.text"]
+
+    // Check for finish reason - useful for debugging empty responses
+    const finishReason = originalAttrs["ai.response.finishReason"]
+    if (finishReason) {
+      newAttrs["gen_ai.response.finish_reasons"] = Array.isArray(finishReason)
+        ? finishReason
+        : [finishReason]
+    }
+
     if (outputValue) {
       // Pretty-print JSON outputs for readability (configurable via OTEL_PRETTY_OUTPUT)
       // Default: true (pretty), set to "false" for minified
@@ -178,6 +195,21 @@ class LangSmithAttributeProcessor implements SpanProcessor {
       // Also emit as completion.0 for LangSmith
       newAttrs["gen_ai.completion.0.role"] = "assistant"
       newAttrs["gen_ai.completion.0.content"] = formattedOutput
+    } else if (span.name.startsWith("ai.") && span.name !== "ai.toolCall") {
+      // For LLM spans without output, check if there were tool calls in the response
+      // Tool-only responses (no text output) are valid - the model chose to call tools instead
+      const toolCallsValue = originalAttrs["ai.response.toolCalls"]
+      if (toolCallsValue) {
+        // Model responded with tool calls - this is a valid response, not an error
+        newAttrs["output.value"] = "[Model responded with tool calls]"
+        newAttrs["gen_ai.completion.0.role"] = "assistant"
+        newAttrs["gen_ai.completion.0.content"] = "[Tool calls - see tool_calls attributes]"
+      } else if (finishReason) {
+        // No output and no tool calls - indicate why based on finish reason
+        newAttrs["output.value"] = `[No text output - finish_reason: ${finishReason}]`
+      }
+      // If no output, no tool calls, and no finish reason, leave output.value unset
+      // This indicates the span ended without capturing any response data
     }
 
     // Set span kind for LangSmith (helps with visualization)
@@ -189,48 +221,81 @@ class LangSmithAttributeProcessor implements SpanProcessor {
     }
 
     // Parse tool calls from response for LangSmith TOOLS tab
+    // AI SDK format: JSON string of array with { toolCallId, toolName, input }
     const toolCallsValue = originalAttrs["ai.response.toolCalls"]
     if (toolCallsValue) {
       try {
         const toolCalls = typeof toolCallsValue === "string" ? JSON.parse(toolCallsValue) : toolCallsValue
         if (Array.isArray(toolCalls)) {
-          toolCalls.forEach((tc: { toolCallId?: string; toolName?: string; args?: unknown }, i: number) => {
+          toolCalls.forEach((tc: { toolCallId?: string; toolName?: string; input?: unknown; args?: unknown }, i: number) => {
             if (tc.toolCallId) newAttrs[`tool_calls.${i}.id`] = tc.toolCallId
             if (tc.toolName) newAttrs[`tool_calls.${i}.function.name`] = tc.toolName
-            if (tc.args) {
+            // AI SDK uses "input", but support "args" as fallback for compatibility
+            const toolArgs = tc.input ?? tc.args
+            if (toolArgs) {
               newAttrs[`tool_calls.${i}.function.arguments`] =
-                typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args)
+                typeof toolArgs === "string" ? toolArgs : JSON.stringify(toolArgs)
             }
           })
           // Also store as gen_ai format for broader compatibility
-          newAttrs["gen_ai.completion.tool_calls"] = toolCallsValue
+          newAttrs["gen_ai.completion.tool_calls"] = typeof toolCallsValue === "string" ? toolCallsValue : JSON.stringify(toolCallsValue)
         }
-      } catch {
-        // If parsing fails, keep the raw value
-        newAttrs["gen_ai.completion.tool_calls"] = toolCallsValue
+      } catch (e) {
+        // If parsing fails, keep the raw value and log for debugging
+        if (process.env.OTEL_DEBUG_ATTRS === "true") {
+          console.error(`[OTEL DEBUG] Failed to parse toolCalls: ${e}`)
+        }
+        newAttrs["gen_ai.completion.tool_calls"] = typeof toolCallsValue === "string" ? toolCallsValue : JSON.stringify(toolCallsValue)
       }
     }
 
     // Parse tool definitions for LangSmith TOOLS tab
+    // AI SDK sends ai.prompt.tools as an array of JSON strings (each tool is individually stringified)
     const toolsValue = originalAttrs["ai.prompt.tools"]
     if (toolsValue) {
       try {
-        const tools = typeof toolsValue === "string" ? JSON.parse(toolsValue) : toolsValue
-        if (Array.isArray(tools)) {
-          // Format tools as OpenAI-style function definitions for LangSmith
-          const formattedTools = tools.map((t: { type?: string; name?: string; description?: string; inputSchema?: unknown }) => ({
-            type: t.type || "function",
-            function: {
-              name: t.name,
-              description: t.description,
-              parameters: t.inputSchema,
-            },
-          }))
-          newAttrs["tools"] = JSON.stringify(formattedTools)
+        let tools: Array<{ type?: string; name?: string; description?: string; inputSchema?: unknown }>
+
+        if (Array.isArray(toolsValue)) {
+          // AI SDK format: array of JSON strings, parse each one
+          tools = toolsValue.map((t) => (typeof t === "string" ? JSON.parse(t) : t))
+        } else if (typeof toolsValue === "string") {
+          // Fallback: try parsing as a JSON array
+          const parsed = JSON.parse(toolsValue)
+          tools = Array.isArray(parsed) ? parsed : [parsed]
+        } else if (typeof toolsValue === "object") {
+          // Single tool object
+          tools = [toolsValue as { type?: string; name?: string; description?: string; inputSchema?: unknown }]
+        } else {
+          // Unexpected type (number, boolean) - skip processing
+          tools = []
         }
-      } catch {
-        // If parsing fails, keep the raw value
-        newAttrs["tools"] = toolsValue
+
+        // Debug: log parsed tools
+        if (process.env.OTEL_DEBUG_ATTRS === "true") {
+          console.error(`[OTEL DEBUG] Parsed ${tools.length} tools`)
+          tools.forEach((t, i) => {
+            console.error(`[OTEL DEBUG] Tool ${i}: name=${t.name}, desc=${t.description?.slice(0, 50)}..., hasSchema=${!!t.inputSchema}`)
+          })
+        }
+
+        // Format tools as OpenAI-style function definitions for LangSmith
+        const formattedTools = tools.map((t) => ({
+          type: "function",
+          function: {
+            name: t.name || "",
+            description: t.description || "",
+            parameters: t.inputSchema || {},
+          },
+        }))
+        newAttrs["tools"] = JSON.stringify(formattedTools)
+      } catch (e) {
+        // If parsing fails, keep the raw value and log for debugging
+        if (process.env.OTEL_DEBUG_ATTRS === "true") {
+          console.error(`[OTEL DEBUG] Failed to parse tools: ${e}`)
+          console.error(`[OTEL DEBUG] toolsValue type: ${typeof toolsValue}, isArray: ${Array.isArray(toolsValue)}`)
+        }
+        newAttrs["tools"] = typeof toolsValue === "string" ? toolsValue : JSON.stringify(toolsValue)
       }
     }
 
@@ -302,6 +367,42 @@ function getSessionIdFromEnv(): string | undefined {
 
   const match = attrs.match(/session\.id=([^,]+)/)
   return match?.[1]
+}
+
+/**
+ * Extract parent context from TRACEPARENT environment variable.
+ * This enables OpenCode spans to be children of orchestrator spans.
+ *
+ * Uses W3C Trace Context standard for propagation:
+ * - TRACEPARENT: Contains trace-id, parent-id, and trace-flags
+ * - TRACESTATE: Optional vendor-specific trace data
+ *
+ * @returns The extracted context, or the current active context if no TRACEPARENT is set
+ */
+export function getParentContextFromEnv(): Context {
+  const traceparent = process.env.TRACEPARENT
+  const tracestate = process.env.TRACESTATE
+
+  if (!traceparent) {
+    return otelContext.active()
+  }
+
+  // Debug: Log trace context if debugging is enabled
+  if (process.env.OTEL_DEBUG_ATTRS === "true") {
+    console.error(`[OTEL DEBUG] TRACEPARENT: ${traceparent}`)
+    if (tracestate) {
+      console.error(`[OTEL DEBUG] TRACESTATE: ${tracestate}`)
+    }
+  }
+
+  // Create carrier with trace context headers (lowercase as per W3C spec)
+  const carrier: Record<string, string> = { traceparent }
+  if (tracestate) {
+    carrier.tracestate = tracestate
+  }
+
+  // Extract context using W3C Trace Context propagator
+  return propagation.extract(otelContext.active(), carrier)
 }
 
 /**
