@@ -25,7 +25,10 @@ import {
   context as otelContext,
   type Context,
 } from "@opentelemetry/api"
-import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http"
+// NOTE: We use a custom fetch-based exporter instead of OTLPTraceExporter
+// because the Node.js http-based exporter doesn't work in Bun subprocess environments
+// import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http"
+import { FetchOTLPTraceExporter } from "./fetch-exporter"
 import { Resource } from "@opentelemetry/resources"
 import {
   BatchSpanProcessor,
@@ -468,13 +471,16 @@ export function initTracing(opts?: TracingOptions): void {
     ...(serviceVersion ? { [ATTR_SERVICE_VERSION]: serviceVersion } : {}),
   })
 
-  // Create the OTLP exporter
-  // The exporter reads these env vars automatically:
-  // - OTEL_EXPORTER_OTLP_ENDPOINT
-  // - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+  // Create the OTLP exporter using our custom fetch-based implementation
+  // This works with Bun runtime (unlike @opentelemetry/exporter-trace-otlp-http
+  // which uses Node.js http modules that timeout in Bun subprocesses)
+  //
+  // The exporter reads these env vars:
+  // - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT
   // - OTEL_EXPORTER_OTLP_HEADERS
-  // - OTEL_EXPORTER_OTLP_PROTOCOL (defaults to http/protobuf for this exporter)
-  const exporter = new OTLPTraceExporter()
+  const exporter = new FetchOTLPTraceExporter({
+    timeoutMs: 30000,
+  })
 
   // Create the tracer provider
   provider = new NodeTracerProvider({
@@ -482,18 +488,26 @@ export function initTracing(opts?: TracingOptions): void {
   })
 
   // Use BatchSpanProcessor for production (batches spans for efficiency)
-  // Use SimpleSpanProcessor for debugging (exports immediately)
-  const baseProcessor =
-    opts?.debug || process.env.OTEL_LOG_LEVEL === "debug"
-      ? new SimpleSpanProcessor(exporter)
-      : new BatchSpanProcessor(exporter, {
-          // Export spans every 5 seconds or when batch is full
-          scheduledDelayMillis: 5000,
-          // Max batch size
-          maxExportBatchSize: 512,
-          // Max queue size
-          maxQueueSize: 2048,
-        })
+  // Use SimpleSpanProcessor for:
+  //   - Debug mode (immediate export for troubleshooting)
+  //   - Subprocess runs (orchestrator spawns) to avoid 5s delay on short-lived processes
+  const isSubprocess = Boolean(process.env.OTEL_RESOURCE_ATTRIBUTES?.includes("session.id="))
+  const useSimpleProcessor = opts?.debug || process.env.OTEL_LOG_LEVEL === "debug" || isSubprocess
+
+  const baseProcessor = useSimpleProcessor
+    ? new SimpleSpanProcessor(exporter)
+    : new BatchSpanProcessor(exporter, {
+        // Export spans every 5 seconds or when batch is full
+        scheduledDelayMillis: 5000,
+        // Max batch size
+        maxExportBatchSize: 512,
+        // Max queue size
+        maxQueueSize: 2048,
+      })
+
+  if (isSubprocess) {
+    console.error("[OTEL] Using SimpleSpanProcessor for subprocess (immediate export)")
+  }
 
   // Wrap with LangSmith attribute transformer for compatibility
   const spanProcessor = new LangSmithAttributeProcessor(baseProcessor)
