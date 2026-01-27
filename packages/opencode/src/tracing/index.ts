@@ -218,11 +218,14 @@ class LangSmithAttributeProcessor implements SpanProcessor {
     // Set span kind for LangSmith (helps with visualization)
     // Tool call spans get "tool" kind, LLM spans get "llm" kind
     // Also set gen_ai.operation.name for OTEL semantic conventions
+    // Set openinference.span.kind (CAPITAL case) for LangSmith run_type mapping
     if (span.name === "ai.toolCall") {
       newAttrs["langsmith.span.kind"] = "tool"
+      newAttrs["openinference.span.kind"] = "TOOL"  // Capital for LangSmith run_type mapping
       newAttrs["gen_ai.operation.name"] = "tool_call"
     } else if (span.name.startsWith("ai.")) {
       newAttrs["langsmith.span.kind"] = "llm"
+      newAttrs["openinference.span.kind"] = "LLM"  // Capital for LangSmith run_type mapping
       newAttrs["gen_ai.operation.name"] = "chat"
     }
 
