@@ -217,10 +217,13 @@ class LangSmithAttributeProcessor implements SpanProcessor {
 
     // Set span kind for LangSmith (helps with visualization)
     // Tool call spans get "tool" kind, LLM spans get "llm" kind
+    // Also set gen_ai.operation.name for OTEL semantic conventions
     if (span.name === "ai.toolCall") {
       newAttrs["langsmith.span.kind"] = "tool"
+      newAttrs["gen_ai.operation.name"] = "tool_call"
     } else if (span.name.startsWith("ai.")) {
       newAttrs["langsmith.span.kind"] = "llm"
+      newAttrs["gen_ai.operation.name"] = "chat"
     }
 
     // Parse tool calls from response for LangSmith TOOLS tab
@@ -465,10 +468,16 @@ export function initTracing(opts?: TracingOptions): void {
 
   diag.info(`Initializing OpenTelemetry tracing for service: ${serviceName}`)
 
+  // Determine deployment environment
+  const environment = process.env.DEPLOYMENT_ENVIRONMENT ||
+                      process.env.NODE_ENV ||
+                      "development"
+
   // Create resource with service information
   const resource = new Resource({
     [ATTR_SERVICE_NAME]: serviceName,
     ...(serviceVersion ? { [ATTR_SERVICE_VERSION]: serviceVersion } : {}),
+    "deployment.environment": environment,
   })
 
   // Create the OTLP exporter using our custom fetch-based implementation

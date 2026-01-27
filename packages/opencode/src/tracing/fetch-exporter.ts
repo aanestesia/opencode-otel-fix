@@ -99,7 +99,7 @@ function spanToOtlpJson(span: ReadableSpan): object {
     spanId: spanContext.spanId,
     parentSpanId: span.parentSpanId || undefined,
     name: span.name,
-    kind: span.kind + 1, // OTLP uses 1-indexed enum
+    kind: span.kind,  // OTLP and SDK both use 0-indexed SpanKind enum
     startTimeUnixNano: hrTimeToNanos(span.startTime),
     endTimeUnixNano: hrTimeToNanos(span.endTime),
     attributes,
