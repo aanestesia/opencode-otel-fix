@@ -12,8 +12,6 @@
  * - OTEL_EXPORTER_OTLP_HEADERS: Headers for the exporter (e.g., "x-api-key=...")
  * - OTEL_EXPORTER_OTLP_PROTOCOL: Protocol (defaults to "http/protobuf")
  * - OTEL_LOG_LEVEL: Set to "debug" for diagnostic logging
- * - OTEL_PRETTY_OUTPUT: Pretty-print JSON outputs (default: "true", set to "false" for minified)
- * - OTEL_DEBUG_ATTRS: Set to "true" to log span attributes to stderr for debugging
  */
 
 import {
@@ -23,6 +21,7 @@ import {
   trace,
   propagation,
   context as otelContext,
+  ROOT_CONTEXT,
   type Context,
 } from "@opentelemetry/api"
 // NOTE: We use a custom fetch-based exporter instead of OTLPTraceExporter
@@ -51,11 +50,14 @@ const AI_SDK_TO_LANGSMITH_ATTRS: Record<string, string> = {
 
   // Model info
   "ai.model.id": "gen_ai.request.model",
-  "ai.model.provider": "gen_ai.system",
+  "ai.model.provider": "gen_ai.provider.name",
 
   // Token usage
   "ai.usage.promptTokens": "gen_ai.usage.prompt_tokens",
   "ai.usage.completionTokens": "gen_ai.usage.completion_tokens",
+  "ai.usage.inputTokens": "gen_ai.usage.prompt_tokens",
+  "ai.usage.outputTokens": "gen_ai.usage.completion_tokens",
+  "ai.usage.totalTokens": "gen_ai.usage.total_tokens",
 
   // Settings
   "ai.settings.maxTokens": "gen_ai.request.max_tokens",
@@ -108,20 +110,21 @@ class LangSmithAttributeProcessor implements SpanProcessor {
     const originalAttrs = span.attributes
     const newAttrs: Record<string, any> = { ...originalAttrs }
 
-    // Debug: Log all AI SDK attributes for investigation
-    if (process.env.OTEL_DEBUG_ATTRS === "true" && span.name.startsWith("ai.")) {
-      const aiAttrs = Object.entries(originalAttrs)
-        .filter(([k]) => k.startsWith("ai.") || k.startsWith("gen_ai."))
-        .map(([k, v]) => `${k}=${typeof v === "string" && v.length > 100 ? v.slice(0, 100) + "..." : v}`)
-      console.error(`[OTEL DEBUG] Span: ${span.name}`)
-      console.error(`[OTEL DEBUG] AI Attributes: ${aiAttrs.length > 0 ? aiAttrs.join(", ") : "NONE"}`)
-      console.error(`[OTEL DEBUG] All keys: ${Object.keys(originalAttrs).join(", ")}`)
-    }
-
     // Map AI SDK attributes to LangSmith format
     for (const [aiKey, langsmithKey] of Object.entries(AI_SDK_TO_LANGSMITH_ATTRS)) {
       if (originalAttrs[aiKey] !== undefined) {
         newAttrs[langsmithKey] = originalAttrs[aiKey]
+      }
+    }
+
+    // Ensure provider name is set if available
+    if (!newAttrs["gen_ai.provider.name"]) {
+      const providerName =
+        originalAttrs["ai.model.provider"] ||
+        originalAttrs["ai.telemetry.metadata.providerId"] ||
+        originalAttrs["ai.provider.name"]
+      if (providerName) {
+        newAttrs["gen_ai.provider.name"] = providerName
       }
     }
 
@@ -181,18 +184,7 @@ class LangSmithAttributeProcessor implements SpanProcessor {
     }
 
     if (outputValue) {
-      // Pretty-print JSON outputs for readability (configurable via OTEL_PRETTY_OUTPUT)
-      // Default: true (pretty), set to "false" for minified
-      const prettyOutput = process.env.OTEL_PRETTY_OUTPUT !== "false"
-      let formattedOutput = outputValue
-      if (typeof outputValue === "string" && prettyOutput) {
-        try {
-          const parsed = JSON.parse(outputValue)
-          formattedOutput = JSON.stringify(parsed, null, 2)
-        } catch {
-          // Not JSON, keep as-is
-        }
-      }
+      const formattedOutput = outputValue
       newAttrs["output.value"] = formattedOutput
       newAttrs["gen_ai.completion"] = formattedOutput
       // Also emit as completion.0 for LangSmith
@@ -215,18 +207,23 @@ class LangSmithAttributeProcessor implements SpanProcessor {
       // This indicates the span ended without capturing any response data
     }
 
-    // Set span kind for LangSmith (helps with visualization)
-    // Tool call spans get "tool" kind, LLM spans get "llm" kind
+    // Set span kind for LangSmith + OpenInference (helps with classification)
+    // Tool call spans get TOOL, LLM spans get LLM, control-plane spans get CHAIN
     // Also set gen_ai.operation.name for OTEL semantic conventions
-    // Set openinference.span.kind (CAPITAL case) for LangSmith run_type mapping
     if (span.name === "ai.toolCall") {
       newAttrs["langsmith.span.kind"] = "tool"
-      newAttrs["openinference.span.kind"] = "TOOL"  // Capital for LangSmith run_type mapping
+      newAttrs["openinference.span.kind"] = "TOOL"
       newAttrs["gen_ai.operation.name"] = "tool_call"
     } else if (span.name.startsWith("ai.")) {
       newAttrs["langsmith.span.kind"] = "llm"
-      newAttrs["openinference.span.kind"] = "LLM"  // Capital for LangSmith run_type mapping
+      newAttrs["openinference.span.kind"] = "LLM"
       newAttrs["gen_ai.operation.name"] = "chat"
+    }
+
+    // Tag OpenCode control-plane spans as chains for LangSmith
+    if (span.name.startsWith("opencode.")) {
+      newAttrs["langsmith.span.kind"] = "chain"
+      newAttrs["openinference.span.kind"] = "CHAIN"
     }
 
     // Parse tool calls from response for LangSmith TOOLS tab
@@ -249,11 +246,8 @@ class LangSmithAttributeProcessor implements SpanProcessor {
           // Also store as gen_ai format for broader compatibility
           newAttrs["gen_ai.completion.tool_calls"] = typeof toolCallsValue === "string" ? toolCallsValue : JSON.stringify(toolCallsValue)
         }
-      } catch (e) {
-        // If parsing fails, keep the raw value and log for debugging
-        if (process.env.OTEL_DEBUG_ATTRS === "true") {
-          console.error(`[OTEL DEBUG] Failed to parse toolCalls: ${e}`)
-        }
+      } catch {
+        // If parsing fails, keep the raw value
         newAttrs["gen_ai.completion.tool_calls"] = typeof toolCallsValue === "string" ? toolCallsValue : JSON.stringify(toolCallsValue)
       }
     }
@@ -280,14 +274,6 @@ class LangSmithAttributeProcessor implements SpanProcessor {
           tools = []
         }
 
-        // Debug: log parsed tools
-        if (process.env.OTEL_DEBUG_ATTRS === "true") {
-          console.error(`[OTEL DEBUG] Parsed ${tools.length} tools`)
-          tools.forEach((t, i) => {
-            console.error(`[OTEL DEBUG] Tool ${i}: name=${t.name}, desc=${t.description?.slice(0, 50)}..., hasSchema=${!!t.inputSchema}`)
-          })
-        }
-
         // Format tools as OpenAI-style function definitions for LangSmith
         const formattedTools = tools.map((t) => ({
           type: "function",
@@ -298,12 +284,8 @@ class LangSmithAttributeProcessor implements SpanProcessor {
           },
         }))
         newAttrs["tools"] = JSON.stringify(formattedTools)
-      } catch (e) {
-        // If parsing fails, keep the raw value and log for debugging
-        if (process.env.OTEL_DEBUG_ATTRS === "true") {
-          console.error(`[OTEL DEBUG] Failed to parse tools: ${e}`)
-          console.error(`[OTEL DEBUG] toolsValue type: ${typeof toolsValue}, isArray: ${Array.isArray(toolsValue)}`)
-        }
+      } catch {
+        // If parsing fails, keep the raw value
         newAttrs["tools"] = typeof toolsValue === "string" ? toolsValue : JSON.stringify(toolsValue)
       }
     }
@@ -315,28 +297,12 @@ class LangSmithAttributeProcessor implements SpanProcessor {
       const toolName = originalAttrs["ai.toolCall.name"]
 
       if (toolArgs) {
-        const prettyOutput = process.env.OTEL_PRETTY_OUTPUT !== "false"
-        let formattedArgs = toolArgs
-        if (typeof toolArgs === "string" && prettyOutput) {
-          try {
-            formattedArgs = JSON.stringify(JSON.parse(toolArgs), null, 2)
-          } catch {
-            // Not JSON, keep as-is
-          }
-        }
+        const formattedArgs = toolArgs
         newAttrs["input.value"] = formattedArgs
       }
 
       if (toolResult) {
-        const prettyOutput = process.env.OTEL_PRETTY_OUTPUT !== "false"
-        let formattedResult = toolResult
-        if (typeof toolResult === "string" && prettyOutput) {
-          try {
-            formattedResult = JSON.stringify(JSON.parse(toolResult), null, 2)
-          } catch {
-            // Not JSON, keep as-is
-          }
-        }
+        const formattedResult = toolResult
         newAttrs["output.value"] = formattedResult
       }
 
@@ -345,10 +311,27 @@ class LangSmithAttributeProcessor implements SpanProcessor {
       }
     }
 
-    // Set thread ID for LangSmith grouping (uses session.id from OTEL_RESOURCE_ATTRIBUTES)
+    // Set LangSmith session ID for thread grouping (uses session.id from OTEL_RESOURCE_ATTRIBUTES)
     const threadId = getSessionIdFromEnv()
     if (threadId) {
-      newAttrs["langsmith.thread.id"] = threadId
+      newAttrs["langsmith.trace.session_id"] = threadId
+      newAttrs["langsmith.metadata.session_id"] = threadId
+    }
+
+    // Provide a stable trace name for LangSmith run mapping
+    if (!newAttrs["langsmith.trace.name"]) {
+      newAttrs["langsmith.trace.name"] = "opencode.run"
+    }
+
+    // Add total token count if prompt + completion tokens are available
+    const promptTokens = newAttrs["gen_ai.usage.prompt_tokens"]
+    const completionTokens = newAttrs["gen_ai.usage.completion_tokens"]
+    if (
+      typeof promptTokens === "number" &&
+      typeof completionTokens === "number" &&
+      newAttrs["gen_ai.usage.total_tokens"] === undefined
+    ) {
+      newAttrs["gen_ai.usage.total_tokens"] = promptTokens + completionTokens
     }
 
     // Return a proxy that uses transformed attributes
@@ -393,15 +376,8 @@ export function getParentContextFromEnv(): Context {
   const tracestate = process.env.TRACESTATE
 
   if (!traceparent) {
+    diag.debug("TRACEPARENT not set; using active context")
     return otelContext.active()
-  }
-
-  // Debug: Log trace context if debugging is enabled
-  if (process.env.OTEL_DEBUG_ATTRS === "true") {
-    console.error(`[OTEL DEBUG] TRACEPARENT: ${traceparent}`)
-    if (tracestate) {
-      console.error(`[OTEL DEBUG] TRACESTATE: ${tracestate}`)
-    }
   }
 
   // Create carrier with trace context headers (lowercase as per W3C spec)
@@ -411,7 +387,16 @@ export function getParentContextFromEnv(): Context {
   }
 
   // Extract context using W3C Trace Context propagator
-  return propagation.extract(otelContext.active(), carrier)
+  const extracted = propagation.extract(ROOT_CONTEXT, carrier)
+  const spanContext = trace.getSpan(extracted)?.spanContext()
+  if (spanContext) {
+    diag.debug(
+      `Extracted TRACEPARENT: traceId=${spanContext.traceId} spanId=${spanContext.spanId} sampled=${spanContext.traceFlags === 1}`,
+    )
+  } else {
+    diag.debug("TRACEPARENT extraction returned no span context")
+  }
+  return extracted
 }
 
 /**
@@ -500,26 +485,27 @@ export function initTracing(opts?: TracingOptions): void {
   })
 
   // Use BatchSpanProcessor for production (batches spans for efficiency)
-  // Use SimpleSpanProcessor for:
-  //   - Debug mode (immediate export for troubleshooting)
-  //   - Subprocess runs (orchestrator spawns) to avoid 5s delay on short-lived processes
-  const isSubprocess = Boolean(process.env.OTEL_RESOURCE_ATTRIBUTES?.includes("session.id="))
-  const useSimpleProcessor = opts?.debug || process.env.OTEL_LOG_LEVEL === "debug" || isSubprocess
+  // Use SimpleSpanProcessor ONLY for debug mode (immediate export for troubleshooting)
+  //
+  // Subprocess strategy:
+  // - Default: BatchSpanProcessor (parent-first export on shutdown)
+  // - If OPENCODE_PARENT_FIRST=1, use long batch delay + flush on shutdown
+  // - For debug only, allow SimpleSpanProcessor
+  const isSubprocess = process.env.OPENCODE_SUBPROCESS === "1"
+  const parentFirst = process.env.OPENCODE_PARENT_FIRST === "1"
+  const useSimpleProcessor = opts?.debug === true
 
   const baseProcessor = useSimpleProcessor
     ? new SimpleSpanProcessor(exporter)
-    : new BatchSpanProcessor(exporter, {
-        // Export spans every 5 seconds or when batch is full
-        scheduledDelayMillis: 5000,
-        // Max batch size
-        maxExportBatchSize: 512,
-        // Max queue size
-        maxQueueSize: 2048,
-      })
-
-  if (isSubprocess) {
-    console.error("[OTEL] Using SimpleSpanProcessor for subprocess (immediate export)")
-  }
+    : new BatchSpanProcessor(exporter, parentFirst && isSubprocess
+        ? {
+            // Delay export until shutdown to keep parent->child ordering
+            scheduledDelayMillis: 60000,
+            maxExportBatchSize: 10000,
+            maxQueueSize: 10000,
+            exportTimeoutMillis: 30000,
+          }
+        : undefined)
 
   // Wrap with LangSmith attribute transformer for compatibility
   const spanProcessor = new LangSmithAttributeProcessor(baseProcessor)
@@ -550,6 +536,22 @@ export async function shutdownTracing(timeoutMs = 5000): Promise<void> {
   diag.info("Shutting down OpenTelemetry tracing...")
 
   try {
+    const parentFirst = process.env.OPENCODE_PARENT_FIRST === "1"
+    if (parentFirst) {
+      // Give orchestrator parent span time to end/export before we flush children
+      await new Promise<void>((resolve) => setTimeout(resolve, 1500))
+    }
+
+    // Flush pending spans before shutdown for short-lived subprocesses
+    await Promise.race([
+      provider.forceFlush(),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ])
+
+    if (parentFirst) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 500))
+    }
+
     // Race between shutdown and timeout to avoid hanging the CLI
     await Promise.race([
       provider.shutdown(),

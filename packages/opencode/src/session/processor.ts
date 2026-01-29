@@ -59,6 +59,8 @@ export namespace SessionProcessor {
               "opencode.session.id": input.sessionID,
               "opencode.agent": streamInput.agent.name,
               "opencode.model": streamInput.model.id,
+              "langsmith.span.kind": "chain",
+              "openinference.span.kind": "CHAIN",
             },
           })
           // Set this span as the active context so AI SDK spans become children

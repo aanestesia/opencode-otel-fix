@@ -71,7 +71,8 @@ const rootSpan = tracer.startSpan("opencode.run", {
   attributes: {
     "opencode.agent": agentName,
     "opencode.args": process.argv.slice(2).join(" "),
-    "langsmith.thread.id": sessionId,
+    "langsmith.trace.session_id": sessionId,
+    "langsmith.metadata.session_id": sessionId,
   },
 })
 ```
@@ -87,8 +88,6 @@ Tracing is **opt-in** via environment variables:
 | `OTEL_SERVICE_NAME` | Service name (default: "opencode") |
 | `OTEL_RESOURCE_ATTRIBUTES` | Resource attributes (e.g., `session.id=xxx`) |
 | `OTEL_LOG_LEVEL` | Diagnostic logging: `debug`, `info`, `warn`, `error` |
-| `OTEL_PRETTY_OUTPUT` | Pretty-print JSON (default: `true`) |
-| `OTEL_DEBUG_ATTRS` | Log span attributes to stderr |
 
 ## Usage with LangSmith
 
@@ -105,9 +104,8 @@ opencode run "Your prompt here"
 
 - **AI Tab Population**: Inputs/outputs properly displayed in LangSmith
 - **TOOLS Tab Population**: Tool definitions and calls visible
-- **Thread Grouping**: Uses `langsmith.thread.id` for session grouping
+- **Thread Grouping**: Uses `langsmith.trace.session_id` for session grouping
 - **Content Parsing**: Handles `[{type:"text", text:"..."}]` content arrays
-- **JSON Pretty-Printing**: Configurable via `OTEL_PRETTY_OUTPUT`
 - **Graceful Shutdown**: Ensures spans are flushed before exit
 
 ## Dependencies Added

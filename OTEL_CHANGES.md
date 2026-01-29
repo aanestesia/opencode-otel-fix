@@ -43,23 +43,23 @@ OpenCode uses the Vercel AI SDK which has built-in telemetry, but:
 
 ## Quick Start
 
-### With LangSmith
+### With LangSmith (Collector-First, Recommended)
 
 ```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT="https://api.smith.langchain.com/otel"
-export OTEL_EXPORTER_OTLP_HEADERS="x-api-key=${LANGCHAIN_API_KEY}"
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="http://localhost:4318/v1/traces"
+export OTEL_EXPORTER_OTLP_HEADERS="x-api-key=${LANGSMITH_API_KEY},Langsmith-Project=arrow-orchestrator-dev"
 export OTEL_SERVICE_NAME="opencode"
-export OTEL_RESOURCE_ATTRIBUTES="session.id=my-session-$(date +%s)"
+export OTEL_RESOURCE_ATTRIBUTES="service.name=opencode"
 
-# Run from source (recommended - built binary has bundling issues)
-cd packages/opencode
-bun run src/bootstrap.ts run "Your prompt here"
+# Run from the built binary
+OPENCODE_BIN=/path/to/opencode
+$OPENCODE_BIN run "Your prompt here"
 ```
 
 ### With Other OTLP Backends
 
 ```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="http://localhost:4318/v1/traces"
 export OTEL_SERVICE_NAME="opencode"
 
 bun run src/bootstrap.ts run "Your prompt here"
@@ -69,22 +69,18 @@ bun run src/bootstrap.ts run "Your prompt here"
 
 - **AI Tab**: Properly populates inputs/outputs in LangSmith
 - **TOOLS Tab**: Shows tool definitions and calls
-- **Thread Grouping**: Groups traces by session via `langsmith.thread.id`
+- **Thread Grouping**: Groups traces by session via `langsmith.trace.session_id`
 - **Content Parsing**: Handles `[{type:"text", text:"..."}]` arrays
-- **JSON Pretty-Printing**: Configurable via `OTEL_PRETTY_OUTPUT`
-- **Debug Mode**: Set `OTEL_DEBUG_ATTRS=true` to log attributes
 
 ## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP endpoint (required) | - |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | OTLP traces endpoint (required) | - |
 | `OTEL_EXPORTER_OTLP_HEADERS` | Auth headers | - |
 | `OTEL_SERVICE_NAME` | Service name | `opencode` |
 | `OTEL_RESOURCE_ATTRIBUTES` | Resource attrs | - |
 | `OTEL_LOG_LEVEL` | Logging level | - |
-| `OTEL_PRETTY_OUTPUT` | Pretty JSON | `true` |
-| `OTEL_DEBUG_ATTRS` | Debug logging | `false` |
 
 ## Architecture
 
@@ -98,7 +94,8 @@ index.ts
 
 ## Known Issues
 
-- Built binary has OTEL constructor bundling issues - use `bun run src/bootstrap.ts` directly
+- Direct OpenCode → LangSmith export (JSON OTLP) is less reliable than collector-first.
+  Use the local OTEL collector and protobuf export for stability.
 - Some LangSmith TOOLS tab fields may still be empty - attribute mapping ongoing
 
 ## Credits

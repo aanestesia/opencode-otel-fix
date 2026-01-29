@@ -36,7 +36,9 @@ import { EOL } from "os"
 import { WebCommand } from "./cli/cmd/web"
 import { PrCommand } from "./cli/cmd/pr"
 import { SessionCommand } from "./cli/cmd/session"
+import { PingCommand } from "./cli/cmd/ping"
 import { shutdownTracing, getTracer, getParentContextFromEnv } from "./tracing"
+import { trace } from "@opentelemetry/api"
 import { context, SpanStatusCode } from "@opentelemetry/api"
 
 process.on("unhandledRejection", (e) => {
@@ -109,6 +111,7 @@ const cli = yargs(hideBin(process.argv))
   .command(GithubCommand)
   .command(PrCommand)
   .command(SessionCommand)
+  .command(PingCommand)
   .fail((msg, err) => {
     if (
       msg?.startsWith("Unknown argument") ||
@@ -128,26 +131,34 @@ const cli = yargs(hideBin(process.argv))
 const tracer = getTracer("opencode.cli")
 const agentName = process.argv.find((arg, i) => process.argv[i - 1] === "--agent") || "default"
 
-// Parse session.id from OTEL_RESOURCE_ATTRIBUTES for LangSmith thread grouping
-const sessionId = process.env.OTEL_RESOURCE_ATTRIBUTES?.match(/session\.id=([^,]+)/)?.[1]
+// Use explicit session id for metadata tagging; only set trace.session_id with a known tracer-session UUID
+const sessionId =
+  process.env.LANGSMITH_TRACE_SESSION_ID ||
+  process.env.OTEL_RESOURCE_ATTRIBUTES?.match(/session\.id=([^,]+)/)?.[1]
+const traceSessionUuid = process.env.LANGSMITH_TRACE_SESSION_UUID
 
-// Get parent context from TRACEPARENT env var for trace linking with orchestrator
-// This allows OpenCode spans to appear as children of the orchestrator's parent span
 const parentContext = getParentContextFromEnv()
 
-const rootSpan = tracer.startSpan("opencode.run", {
-  attributes: {
-    "opencode.agent": agentName,
-    "opencode.args": process.argv.slice(2).join(" "),
-    "service.name": process.env.OTEL_SERVICE_NAME || "opencode",
-    // LangSmith thread grouping - all traces with same session ID are grouped
-    ...(sessionId ? { "langsmith.thread.id": sessionId } : {}),
+const rootSpan = tracer.startSpan(
+  "opencode.run",
+  {
+    attributes: {
+      "opencode.agent": agentName,
+      "opencode.args": process.argv.slice(2).join(" "),
+      "langsmith.span.kind": "chain",
+      "openinference.span.kind": "CHAIN",
+      "langsmith.trace.name": "opencode.run",
+      // LangSmith grouping: only set trace.session_id when a valid tracer-session UUID is provided
+      ...(traceSessionUuid ? { "langsmith.trace.session_id": traceSessionUuid } : {}),
+      ...(sessionId ? { "langsmith.metadata.session_id": sessionId } : {}),
+    },
   },
-}, parentContext)
+  parentContext,
+)
 
 // Run CLI within the root span context so all child spans are linked
 try {
-  await context.with(context.active().setValue(Symbol.for("OpenTelemetry Context Key SPAN"), rootSpan), async () => {
+  await context.with(trace.setSpan(parentContext, rootSpan), async () => {
     await cli.parse()
   })
   rootSpan.setStatus({ code: SpanStatusCode.OK })
@@ -196,7 +207,6 @@ try {
   // Flush OpenTelemetry spans before exiting
   // This is critical - without this, spans may be lost
   await shutdownTracing()
-
   // Some subprocesses don't react properly to SIGTERM and similar signals.
   // Most notably, some docker-container-based MCP servers don't handle such signals unless
   // run using `docker run --init`.

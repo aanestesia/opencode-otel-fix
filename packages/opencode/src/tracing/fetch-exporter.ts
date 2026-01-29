@@ -34,6 +34,7 @@ export interface FetchOTLPExporterConfig {
   compression?: boolean
 }
 
+
 /**
  * Convert a ReadableSpan to OTLP JSON format.
  * Based on OTLP/HTTP JSON spec: https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding
@@ -42,23 +43,26 @@ function spanToOtlpJson(span: ReadableSpan): object {
   const spanContext = span.spanContext()
 
   // Convert attributes to OTLP format
+  // IMPORTANT: Per OTLP JSON protobuf encoding, int64 values MUST be strings
+  // See: https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding
   const attributes = Object.entries(span.attributes).map(([key, value]) => {
     let attrValue: object
     if (typeof value === "string") {
       attrValue = { stringValue: value }
     } else if (typeof value === "number") {
       if (Number.isInteger(value)) {
-        attrValue = { intValue: value }
+        // intValue must be a STRING per protobuf-JSON encoding rules
+        attrValue = { intValue: String(value) }
       } else {
         attrValue = { doubleValue: value }
       }
     } else if (typeof value === "boolean") {
       attrValue = { boolValue: value }
     } else if (Array.isArray(value)) {
-      // Array values
+      // Array values - also need string encoding for integers
       const arrayValue = value.map((v) => {
         if (typeof v === "string") return { stringValue: v }
-        if (typeof v === "number") return Number.isInteger(v) ? { intValue: v } : { doubleValue: v }
+        if (typeof v === "number") return Number.isInteger(v) ? { intValue: String(v) } : { doubleValue: v }
         if (typeof v === "boolean") return { boolValue: v }
         return { stringValue: String(v) }
       })
@@ -265,9 +269,15 @@ export class FetchOTLPTraceExporter implements SpanExporter {
 
       clearTimeout(timeoutId)
 
+      const responseText = await response.text().catch(() => "")
+      if (process.env.OPENCODE_OTEL_LOG_RESPONSE === "1") {
+        console.error(
+          `[FetchOTLPExporter] response=${response.status} ${response.statusText} body=${responseText || "<empty>"}`
+        )
+      }
+
       if (!response.ok) {
-        const errorBody = await response.text().catch(() => "")
-        throw new Error(`HTTP ${response.status}: ${response.statusText}. ${errorBody}`)
+        throw new Error(`HTTP ${response.status}: ${response.statusText}. ${responseText}`)
       }
 
       diag.debug(`[FetchOTLPExporter] Successfully exported ${spans.length} spans`)

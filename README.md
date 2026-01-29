@@ -35,6 +35,14 @@
 
 ---
 
+### OTEL Fork Notes
+
+This fork adds OpenTelemetry tracing for LangSmith.
+See `OTEL_CHANGES.md` for the exact environment variables and setup.
+
+Recommended: use a local OTEL collector and point
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to `http://localhost:4318/v1/traces`.
+
 ### Installation
 
 ```bash
