@@ -327,6 +327,11 @@ class LangSmithAttributeProcessor implements SpanProcessor {
       newAttrs["gen_ai.conversation.id"] = threadId
     }
 
+    const schemaVersion = process.env.ARROW_TELEMETRY_SCHEMA_VERSION
+    if (schemaVersion) {
+      newAttrs["langsmith.metadata.telemetry_schema_version"] = schemaVersion
+    }
+
     // Provide a stable trace name for LangSmith run mapping
     if (!newAttrs["langsmith.trace.name"]) {
       newAttrs["langsmith.trace.name"] = "opencode.run"
