@@ -69,7 +69,7 @@ bun run src/bootstrap.ts run "Your prompt here"
 
 - **AI Tab**: Properly populates inputs/outputs in LangSmith
 - **TOOLS Tab**: Shows tool definitions and calls
-- **Thread Grouping**: Groups traces by session via `langsmith.trace.session_id`
+- **Thread Grouping**: Uses `langsmith.metadata.session_id` + `gen_ai.conversation.id`
 - **Content Parsing**: Handles `[{type:"text", text:"..."}]` arrays
 
 ## Environment Variables

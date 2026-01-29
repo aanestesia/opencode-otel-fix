@@ -76,17 +76,17 @@ describe("SpanKind in OTLP export (no +1 offset)", () => {
 })
 
 describe("gen_ai.operation.name attribute", () => {
-  test("tool spans should have operation.name = tool_call", () => {
+  test("tool spans should have operation.name = execute_tool", () => {
     // This tests the Phase 3A fix
     const spanName = "ai.toolCall"
     const newAttrs: Record<string, string> = {}
 
     if (spanName === "ai.toolCall") {
       newAttrs["langsmith.span.kind"] = "tool"
-      newAttrs["gen_ai.operation.name"] = "tool_call"
+      newAttrs["gen_ai.operation.name"] = "execute_tool"
     }
 
-    expect(newAttrs["gen_ai.operation.name"]).toBe("tool_call")
+    expect(newAttrs["gen_ai.operation.name"]).toBe("execute_tool")
   })
 
   test("LLM spans should have operation.name = chat", () => {
@@ -95,7 +95,7 @@ describe("gen_ai.operation.name attribute", () => {
 
     if (spanName === "ai.toolCall") {
       newAttrs["langsmith.span.kind"] = "tool"
-      newAttrs["gen_ai.operation.name"] = "tool_call"
+      newAttrs["gen_ai.operation.name"] = "execute_tool"
     } else if (spanName.startsWith("ai.")) {
       newAttrs["langsmith.span.kind"] = "llm"
       newAttrs["gen_ai.operation.name"] = "chat"

@@ -95,7 +95,16 @@ class LangSmithAttributeProcessor implements SpanProcessor {
   onEnd(span: ReadableSpan): void {
     // Transform AI SDK attributes to LangSmith format
     const transformedSpan = this.transformAttributes(span)
-    this.delegate.onEnd(transformedSpan)
+    const newName = this.transformSpanName(span, transformedSpan)
+    const fullyTransformed = new Proxy(transformedSpan, {
+      get(target, prop) {
+        if (prop === "name") {
+          return newName
+        }
+        return (target as any)[prop]
+      },
+    })
+    this.delegate.onEnd(fullyTransformed)
   }
 
   async shutdown(): Promise<void> {
@@ -213,7 +222,7 @@ class LangSmithAttributeProcessor implements SpanProcessor {
     if (span.name === "ai.toolCall") {
       newAttrs["langsmith.span.kind"] = "tool"
       newAttrs["openinference.span.kind"] = "TOOL"
-      newAttrs["gen_ai.operation.name"] = "tool_call"
+      newAttrs["gen_ai.operation.name"] = "execute_tool"
     } else if (span.name.startsWith("ai.")) {
       newAttrs["langsmith.span.kind"] = "llm"
       newAttrs["openinference.span.kind"] = "LLM"
@@ -314,8 +323,8 @@ class LangSmithAttributeProcessor implements SpanProcessor {
     // Set LangSmith session ID for thread grouping (uses session.id from OTEL_RESOURCE_ATTRIBUTES)
     const threadId = getSessionIdFromEnv()
     if (threadId) {
-      newAttrs["langsmith.trace.session_id"] = threadId
       newAttrs["langsmith.metadata.session_id"] = threadId
+      newAttrs["gen_ai.conversation.id"] = threadId
     }
 
     // Provide a stable trace name for LangSmith run mapping
@@ -344,6 +353,26 @@ class LangSmithAttributeProcessor implements SpanProcessor {
       },
     })
   }
+
+  private transformSpanName(span: ReadableSpan, transformed: ReadableSpan): string {
+    if (span.name === "ai.toolCall") {
+      const toolName =
+        span.attributes["ai.toolCall.name"] ||
+        (transformed.attributes as Record<string, any>)["gen_ai.tool.name"] ||
+        "unknown"
+      return `execute_tool ${toolName}`
+    }
+
+    if (span.name.startsWith("ai.")) {
+      const model =
+        (transformed.attributes as Record<string, any>)["gen_ai.request.model"] ||
+        span.attributes["ai.model.id"] ||
+        "unknown"
+      return `chat ${model}`
+    }
+
+    return span.name
+  }
 }
 
 let provider: NodeTracerProvider | null = null
@@ -354,11 +383,32 @@ let initialized = false
  * Format: "session.id=xxx,agent.name=yyy,..."
  */
 function getSessionIdFromEnv(): string | undefined {
+  const explicitSessionId = process.env.LANGSMITH_TRACE_SESSION_ID
+  if (explicitSessionId) return explicitSessionId
+
   const attrs = process.env.OTEL_RESOURCE_ATTRIBUTES
   if (!attrs) return undefined
 
   const match = attrs.match(/session\.id=([^,]+)/)
   return match?.[1]
+}
+
+function getLangsmithProjectFromEnv(): string | undefined {
+  if (process.env.ARROW_OPENCODE_PROJECT) return process.env.ARROW_OPENCODE_PROJECT
+  if (process.env.LANGSMITH_PROJECT) return process.env.LANGSMITH_PROJECT
+
+  const headers = process.env.OTEL_EXPORTER_OTLP_HEADERS
+  if (!headers) return undefined
+
+  // Header format: key=value,key2=value2
+  for (const pair of headers.split(",")) {
+    const [rawKey, ...valueParts] = pair.split("=")
+    if (!rawKey || valueParts.length === 0) continue
+    const key = rawKey.trim().toLowerCase()
+    if (key === "langsmith-project") return valueParts.join("=").trim()
+  }
+
+  return undefined
 }
 
 /**
@@ -466,6 +516,9 @@ export function initTracing(opts?: TracingOptions): void {
     [ATTR_SERVICE_NAME]: serviceName,
     ...(serviceVersion ? { [ATTR_SERVICE_VERSION]: serviceVersion } : {}),
     "deployment.environment": environment,
+    ...(getLangsmithProjectFromEnv()
+      ? { "langsmith.project": getLangsmithProjectFromEnv() }
+      : {}),
   })
 
   // Create the OTLP exporter using our custom fetch-based implementation

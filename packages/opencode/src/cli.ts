@@ -139,6 +139,21 @@ const traceSessionUuid = process.env.LANGSMITH_TRACE_SESSION_UUID
 
 const parentContext = getParentContextFromEnv()
 
+const cliSpan = tracer.startSpan(
+  "opencode",
+  {
+    attributes: {
+      "process.executable.name": "opencode",
+      "process.command": process.argv[1] || "opencode",
+      "process.command_line": process.argv.join(" "),
+      "langsmith.span.kind": "chain",
+      "openinference.span.kind": "CHAIN",
+    },
+  },
+  parentContext,
+)
+const cliContext = trace.setSpan(parentContext, cliSpan)
+
 const rootSpan = tracer.startSpan(
   "opencode.run",
   {
@@ -148,22 +163,23 @@ const rootSpan = tracer.startSpan(
       "langsmith.span.kind": "chain",
       "openinference.span.kind": "CHAIN",
       "langsmith.trace.name": "opencode.run",
-      // LangSmith grouping: only set trace.session_id when a valid tracer-session UUID is provided
-      ...(traceSessionUuid ? { "langsmith.trace.session_id": traceSessionUuid } : {}),
+      // LangSmith grouping: keep session_id in metadata only (avoid per-session projects)
       ...(sessionId ? { "langsmith.metadata.session_id": sessionId } : {}),
     },
   },
-  parentContext,
+  cliContext,
 )
 
 // Run CLI within the root span context so all child spans are linked
 try {
-  await context.with(trace.setSpan(parentContext, rootSpan), async () => {
+  await context.with(trace.setSpan(cliContext, rootSpan), async () => {
     await cli.parse()
   })
   rootSpan.setStatus({ code: SpanStatusCode.OK })
+  cliSpan.setStatus({ code: SpanStatusCode.OK })
 } catch (e) {
   rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: e instanceof Error ? e.message : String(e) })
+  cliSpan.setStatus({ code: SpanStatusCode.ERROR, message: e instanceof Error ? e.message : String(e) })
   let data: Record<string, any> = {}
   if (e instanceof NamedError) {
     const obj = e.toObject()
@@ -203,6 +219,7 @@ try {
 } finally {
   // End the root span
   rootSpan.end()
+  cliSpan.end()
 
   // Flush OpenTelemetry spans before exiting
   // This is critical - without this, spans may be lost

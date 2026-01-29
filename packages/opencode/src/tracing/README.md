@@ -71,7 +71,6 @@ const rootSpan = tracer.startSpan("opencode.run", {
   attributes: {
     "opencode.agent": agentName,
     "opencode.args": process.argv.slice(2).join(" "),
-    "langsmith.trace.session_id": sessionId,
     "langsmith.metadata.session_id": sessionId,
   },
 })
@@ -104,7 +103,7 @@ opencode run "Your prompt here"
 
 - **AI Tab Population**: Inputs/outputs properly displayed in LangSmith
 - **TOOLS Tab Population**: Tool definitions and calls visible
-- **Thread Grouping**: Uses `langsmith.trace.session_id` for session grouping
+- **Thread Grouping**: Uses `langsmith.metadata.session_id` + `gen_ai.conversation.id`
 - **Content Parsing**: Handles `[{type:"text", text:"..."}]` content arrays
 - **Graceful Shutdown**: Ensures spans are flushed before exit
 
