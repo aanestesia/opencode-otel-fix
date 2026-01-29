@@ -90,7 +90,7 @@ describe("gen_ai.operation.name attribute", () => {
   })
 
   test("LLM spans should have operation.name = chat", () => {
-    const spanName = "ai.generateText"
+    const spanName: string = "ai.generateText"
     const newAttrs: Record<string, string> = {}
 
     if (spanName === "ai.toolCall") {
