@@ -50,10 +50,12 @@ export namespace SessionProcessor {
         log.info("process")
         needsCompaction = false
         const shouldBreak = (await Config.get()).experimental?.continue_loop_on_deny !== true
+        // OPENCODE_FLAT_TRACING=1 disables per-step spans for flatter trace hierarchy
+        const flatTracing = process.env.OPENCODE_FLAT_TRACING === "1"
         while (true) {
           stepNumber++
-          // Create a span for each step to group AI SDK spans hierarchically
-          const stepSpan = tracer.startSpan(`opencode.step`, {
+          // Create a span for each step to group AI SDK spans hierarchically (unless flat tracing)
+          const stepSpan = flatTracing ? null : tracer.startSpan(`opencode.step`, {
             attributes: {
               "opencode.step.number": stepNumber,
               "opencode.session.id": input.sessionID,
@@ -64,7 +66,9 @@ export namespace SessionProcessor {
             },
           })
           // Set this span as the active context so AI SDK spans become children
-          const stepContext = context.active().setValue(Symbol.for("OpenTelemetry Context Key SPAN"), stepSpan)
+          const stepContext = stepSpan
+            ? context.active().setValue(Symbol.for("OpenTelemetry Context Key SPAN"), stepSpan)
+            : context.active()
 
           try {
             let currentText: MessageV2.TextPart | undefined
@@ -361,7 +365,7 @@ export namespace SessionProcessor {
               error: e,
               stack: JSON.stringify(e.stack),
             })
-            stepSpan.setStatus({ code: SpanStatusCode.ERROR, message: e instanceof Error ? e.message : String(e) })
+            stepSpan?.setStatus({ code: SpanStatusCode.ERROR, message: e instanceof Error ? e.message : String(e) })
             const error = MessageV2.fromError(e, { providerID: input.model.providerID })
             const retry = SessionRetry.retryable(error)
             if (retry !== undefined) {
@@ -373,8 +377,8 @@ export namespace SessionProcessor {
                 message: retry,
                 next: Date.now() + delay,
               })
-              stepSpan.setAttribute("opencode.step.retry", true)
-              stepSpan.end()
+              stepSpan?.setAttribute("opencode.step.retry", true)
+              stepSpan?.end()
               await SessionRetry.sleep(delay, input.abort).catch(() => {})
               continue
             }
@@ -418,25 +422,25 @@ export namespace SessionProcessor {
           input.assistantMessage.time.completed = Date.now()
           await Session.updateMessage(input.assistantMessage)
           // End the step span before returning
-          stepSpan.setStatus({ code: SpanStatusCode.OK })
+          stepSpan?.setStatus({ code: SpanStatusCode.OK })
           if (needsCompaction) {
-            stepSpan.setAttribute("opencode.step.result", "compact")
-            stepSpan.end()
+            stepSpan?.setAttribute("opencode.step.result", "compact")
+            stepSpan?.end()
             return "compact"
           }
           if (blocked) {
-            stepSpan.setAttribute("opencode.step.result", "blocked")
-            stepSpan.end()
+            stepSpan?.setAttribute("opencode.step.result", "blocked")
+            stepSpan?.end()
             return "stop"
           }
           if (input.assistantMessage.error) {
-            stepSpan.setStatus({ code: SpanStatusCode.ERROR, message: "assistant_error" })
-            stepSpan.setAttribute("opencode.step.result", "error")
-            stepSpan.end()
+            stepSpan?.setStatus({ code: SpanStatusCode.ERROR, message: "assistant_error" })
+            stepSpan?.setAttribute("opencode.step.result", "error")
+            stepSpan?.end()
             return "stop"
           }
-          stepSpan.setAttribute("opencode.step.result", "continue")
-          stepSpan.end()
+          stepSpan?.setAttribute("opencode.step.result", "continue")
+          stepSpan?.end()
           return "continue"
         }
       },

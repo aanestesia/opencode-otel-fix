@@ -26,3 +26,6 @@ target
 opencode-dev
 logs/
 *.bun-build
+
+# Swarm session/log data
+.swarm/

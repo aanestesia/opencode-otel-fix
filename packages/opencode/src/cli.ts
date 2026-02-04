@@ -139,47 +139,96 @@ const traceSessionUuid = process.env.LANGSMITH_TRACE_SESSION_UUID
 
 const parentContext = getParentContextFromEnv()
 
-const cliSpan = tracer.startSpan(
-  "opencode",
-  {
-    attributes: {
-      "process.executable.name": "opencode",
-      "process.command": process.argv[1] || "opencode",
-      "process.command_line": process.argv.join(" "),
-      "langsmith.span.kind": "chain",
-      "openinference.span.kind": "CHAIN",
-    },
-  },
-  parentContext,
-)
-const cliContext = trace.setSpan(parentContext, cliSpan)
+// Phase 4: Read ARROW_* env vars for telemetry schema enrichment
+// These provide context from the orchestrator for cross-session analysis
+const arrowContext = {
+  taskObjective: process.env.ARROW_TASK_OBJECTIVE || "",
+  domain: process.env.ARROW_DOMAIN || "",
+  subdomain: process.env.ARROW_SUBDOMAIN || "",
+  subdomainId: process.env.ARROW_SUBDOMAIN_ID || "",
+  sessionId: process.env.ARROW_SESSION_ID || "",
+  topKUsed: process.env.ARROW_TOPK_USED || "",
+  entryIdsProvided: process.env.ARROW_ENTRY_IDS_PROVIDED || "",
+  tier: process.env.ARROW_TIER || "",
+  matchScore: process.env.ARROW_MATCH_SCORE || "",
+  schemaVersion: process.env.ARROW_TELEMETRY_SCHEMA_VERSION || "v1",
+}
 
+// Build ARROW span attributes (only include non-empty values)
+const arrowAttributes: Record<string, string | number> = {}
+if (arrowContext.taskObjective) {
+  arrowAttributes["arrow.task.objective"] = arrowContext.taskObjective.slice(0, 200)
+}
+if (arrowContext.domain) {
+  arrowAttributes["arrow.task.domain"] = arrowContext.domain
+  arrowAttributes["langsmith.metadata.domain"] = arrowContext.domain
+}
+if (arrowContext.subdomain) {
+  arrowAttributes["arrow.task.subdomain"] = arrowContext.subdomain
+  arrowAttributes["langsmith.metadata.subdomain"] = arrowContext.subdomain
+}
+if (arrowContext.subdomainId) {
+  arrowAttributes["arrow.task.subdomain_id"] = arrowContext.subdomainId
+}
+if (arrowContext.sessionId) {
+  arrowAttributes["arrow.task.session_id"] = arrowContext.sessionId
+}
+if (arrowContext.topKUsed) {
+  const topK = parseInt(arrowContext.topKUsed, 10)
+  if (!isNaN(topK)) {
+    arrowAttributes["arrow.retrieval.topK_used"] = topK
+  }
+}
+if (arrowContext.entryIdsProvided) {
+  // Store as JSON string for complex data
+  arrowAttributes["arrow.retrieval.entry_ids_provided"] = arrowContext.entryIdsProvided
+}
+if (arrowContext.tier) {
+  const tier = parseInt(arrowContext.tier, 10)
+  if (!isNaN(tier)) {
+    arrowAttributes["arrow.retrieval.tier"] = tier
+  }
+}
+if (arrowContext.matchScore) {
+  const score = parseFloat(arrowContext.matchScore)
+  if (!isNaN(score)) {
+    arrowAttributes["arrow.retrieval.match_score"] = score
+  }
+}
+arrowAttributes["arrow.telemetry_schema_version"] = arrowContext.schemaVersion
+arrowAttributes["langsmith.metadata.telemetry_schema_version"] = arrowContext.schemaVersion
+
+// Allow override via OPENCODE_RUN_NAME env var for orchestrator integration
+// Single root span (removed redundant cliSpan wrapper to flatten hierarchy)
+const runName = process.env.OPENCODE_RUN_NAME || "opencode.run"
 const rootSpan = tracer.startSpan(
-  "opencode.run",
+  runName,
   {
     attributes: {
       "opencode.agent": agentName,
       "opencode.args": process.argv.slice(2).join(" "),
+      "process.command_line": process.argv.join(" "),
       "langsmith.span.kind": "chain",
       "openinference.span.kind": "CHAIN",
-      "langsmith.trace.name": "opencode.run",
+      "langsmith.trace.name": runName,
       // LangSmith grouping: keep session_id in metadata only (avoid per-session projects)
       ...(sessionId ? { "langsmith.metadata.session_id": sessionId } : {}),
+      // Phase 4: ARROW context attributes for telemetry schema
+      ...arrowAttributes,
     },
   },
-  cliContext,
+  parentContext,
 )
+const rootContext = trace.setSpan(parentContext, rootSpan)
 
 // Run CLI within the root span context so all child spans are linked
 try {
-  await context.with(trace.setSpan(cliContext, rootSpan), async () => {
+  await context.with(rootContext, async () => {
     await cli.parse()
   })
   rootSpan.setStatus({ code: SpanStatusCode.OK })
-  cliSpan.setStatus({ code: SpanStatusCode.OK })
 } catch (e) {
   rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: e instanceof Error ? e.message : String(e) })
-  cliSpan.setStatus({ code: SpanStatusCode.ERROR, message: e instanceof Error ? e.message : String(e) })
   let data: Record<string, any> = {}
   if (e instanceof NamedError) {
     const obj = e.toObject()
@@ -219,7 +268,6 @@ try {
 } finally {
   // End the root span
   rootSpan.end()
-  cliSpan.end()
 
   // Flush OpenTelemetry spans before exiting
   // This is critical - without this, spans may be lost

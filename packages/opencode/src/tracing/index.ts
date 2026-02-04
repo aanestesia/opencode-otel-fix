@@ -16,13 +16,13 @@
 
 import {
   diag,
-  DiagConsoleLogger,
   DiagLogLevel,
   trace,
   propagation,
   context as otelContext,
   ROOT_CONTEXT,
   type Context,
+  type DiagLogger,
 } from "@opentelemetry/api"
 // NOTE: We use a custom fetch-based exporter instead of OTLPTraceExporter
 // because the Node.js http-based exporter doesn't work in Bun subprocess environments
@@ -93,6 +93,13 @@ class LangSmithAttributeProcessor implements SpanProcessor {
   }
 
   onEnd(span: ReadableSpan): void {
+    // Filter out AI SDK inner spans (.doStream, .doGenerate) to reduce duplication
+    // These are internal implementation spans that duplicate the outer ai.streamText/ai.generateText spans
+    // Keeping them would cause double LLM entries in traces (e.g., 2x "chat gpt-5.2-codex")
+    if (span.name.includes(".doStream") || span.name.includes(".doGenerate")) {
+      return // Skip - the outer span already captures this information
+    }
+
     // Transform AI SDK attributes to LangSmith format
     const transformedSpan = this.transformAttributes(span)
     const newName = this.transformSpanName(span, transformedSpan)
@@ -332,9 +339,25 @@ class LangSmithAttributeProcessor implements SpanProcessor {
       newAttrs["langsmith.metadata.telemetry_schema_version"] = schemaVersion
     }
 
-    // Provide a stable trace name for LangSmith run mapping
-    if (!newAttrs["langsmith.trace.name"]) {
-      newAttrs["langsmith.trace.name"] = "opencode.run"
+    // OTEL-compliant naming strategy:
+    // - Root/control-plane spans (opencode.*): use OPENCODE_RUN_NAME as langsmith.trace.name
+    // - AI SDK spans (ai.*): let transformSpanName handle naming (chat {model}, execute_tool {name})
+    // This follows OTEL GenAI semantic conventions for aggregatable, low-cardinality names
+    const runNameOverride = process.env.OPENCODE_RUN_NAME
+    if (runNameOverride) {
+      // Extract agent name from "agent.task-analyzer" -> "task-analyzer"
+      const agentName = runNameOverride.startsWith("agent.")
+        ? runNameOverride.slice(6)
+        : runNameOverride
+      // Set agent name on ALL spans for queryability (OTEL standard: use attributes)
+      newAttrs["gen_ai.agent.name"] = agentName
+      newAttrs["langsmith.metadata.agent_name"] = agentName
+
+      // Only set langsmith.trace.name on OpenCode control-plane spans, not AI SDK spans
+      // AI SDK spans will use their transformed names (chat gpt-5.2-codex, execute_tool Glob)
+      if (!span.name.startsWith("ai.") && !newAttrs["langsmith.trace.name"]) {
+        newAttrs["langsmith.trace.name"] = runNameOverride
+      }
     }
 
     // Add total token count if prompt + completion tokens are available
@@ -486,18 +509,39 @@ export function initTracing(opts?: TracingOptions): void {
   }
   initialized = true
 
-  // Enable diagnostic logging if requested
+  // Enable diagnostic logging if requested.
+  // IMPORTANT: keep stdout clean for --format json by writing diagnostics to stderr.
   const logLevel = process.env.OTEL_LOG_LEVEL?.toLowerCase()
-  if (logLevel === "debug") {
-    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.DEBUG)
-  } else if (logLevel === "verbose") {
-    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.VERBOSE)
-  } else if (logLevel === "info") {
-    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.INFO)
-  } else if (logLevel === "warn") {
-    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.WARN)
-  } else if (logLevel === "error") {
-    diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.ERROR)
+  const levelMap: Record<string, DiagLogLevel> = {
+    debug: DiagLogLevel.DEBUG,
+    verbose: DiagLogLevel.VERBOSE,
+    info: DiagLogLevel.INFO,
+    warn: DiagLogLevel.WARN,
+    error: DiagLogLevel.ERROR,
+  }
+  const resolvedLevel = logLevel ? levelMap[logLevel] : undefined
+  if (resolvedLevel !== undefined) {
+    class StderrDiagLogger implements DiagLogger {
+      constructor(private readonly level: DiagLogLevel) {}
+
+      error(message: string, ...args: unknown[]): void {
+        if (this.level >= DiagLogLevel.ERROR) console.error(message, ...args)
+      }
+      warn(message: string, ...args: unknown[]): void {
+        if (this.level >= DiagLogLevel.WARN) console.error(message, ...args)
+      }
+      info(message: string, ...args: unknown[]): void {
+        if (this.level >= DiagLogLevel.INFO) console.error(message, ...args)
+      }
+      debug(message: string, ...args: unknown[]): void {
+        if (this.level >= DiagLogLevel.DEBUG) console.error(message, ...args)
+      }
+      verbose(message: string, ...args: unknown[]): void {
+        if (this.level >= DiagLogLevel.VERBOSE) console.error(message, ...args)
+      }
+    }
+
+    diag.setLogger(new StderrDiagLogger(resolvedLevel), resolvedLevel)
   }
 
   // If no endpoint is configured, do nothing (keeps OTEL opt-in)
